@@ -1,0 +1,22 @@
+# NQ/ES Trade Decision Dashboard
+# ================================
+# Install all dependencies:
+#   pip install -r requirements.txt
+
+# ── Core strategy engine ──────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.24.0
+
+# ── Streamlit web app ─────────────────────────────────────────────────────────
+streamlit>=1.35.0
+
+# ── Topstep / Tradovate API connector ─────────────────────────────────────────
+requests>=2.31.0
+# websocket-client>=1.7.0       # Uncomment when using live WebSocket feed
+
+# ── TradingView webhook receiver ──────────────────────────────────────────────
+# flask>=3.0.0                  # Uncomment when running the webhook server
+
+# ── Optional: data export & charting ─────────────────────────────────────────
+# openpyxl>=3.1.0               # Uncomment to export trades to Excel
+# plotly>=5.18.0                # Uncomment for interactive Plotly charts in Streamlit
