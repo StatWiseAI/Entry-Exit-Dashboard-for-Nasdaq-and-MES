@@ -1,593 +1,686 @@
 """
-NQ/ES Trade Decision — Streamlit App
-=====================================
-Run locally:   streamlit run streamlit_app.py
-Deploy:        push to GitHub → connect at share.streamlit.app
+streamlit_app.py — AI-Powered NQ/ES Trade Decision System
+==========================================================
+Three theoretical streams in one interface:
+  1. SCM decision models (EOQ sizing, Newsvendor SL/TP, safety stock, bullwhip)
+  2. Conversational AI with persistent trader memory (Claude claude-sonnet-4-6)
+  3. Real-time external market intelligence (VIX, macro calendar, news, order flow)
 
-Architecture
-------------
-  [CSV upload]  ──┐
-  [Topstep API] ──┤──► run_strategy() ──► render_decision()
-  [TradingView] ──┘
-
-When live APIs are connected, replace the `load_data_*` functions below.
-The dashboard rendering code never changes.
+Run locally:  streamlit run streamlit_app.py
+Deploy:       push to GitHub -> connect at share.streamlit.app
 """
 
-import time
-import json
+import os, time, json
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
-# ── Optional live connectors (imported only when configured) ──────────────────
-try:
-    from api.topstep_connector import TopstepConnector
-    TOPSTEP_AVAILABLE = True
-except ImportError:
-    TOPSTEP_AVAILABLE = False
-
-try:
-    from api.tradingview_connector import get_latest_tv_bars
-    TRADINGVIEW_AVAILABLE = True
-except ImportError:
-    TRADINGVIEW_AVAILABLE = False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="NQ/ES Trade Decision",
+    page_title="NQ/ES AI Trade Decision",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Minimal dark-mode CSS override ───────────────────────────────────────────
 st.markdown("""
 <style>
-  [data-testid="stSidebar"] { background: #111114; }
-  .block-container { padding-top: 1.2rem; }
-  .signal-box { border-radius: 10px; padding: 20px 24px; margin-bottom: 12px; }
-  .signal-long  { background: rgba(34,197,94,.12);  border: 1px solid rgba(34,197,94,.4); }
-  .signal-short { background: rgba(239,68,68,.12);  border: 1px solid rgba(239,68,68,.4); }
-  .signal-wait  { background: rgba(39,39,42,.6);    border: 1px solid #3f3f46; }
-  .signal-warn  { background: rgba(245,158,11,.10); border: 1px solid rgba(245,158,11,.35); }
-  .big-label { font-size: 28px; font-weight: 800; font-family: 'Syne', sans-serif; }
-  .reason    { font-size: 13px; color: #a1a1aa; margin-top: 6px; font-family: monospace; }
-  .level-row { display:flex; justify-content:space-between; padding:8px 0;
-               border-bottom:1px solid #27272a; font-family:monospace; font-size:13px; }
-  .kpi-grid  { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
-  .kpi-card  { background:#18181c; border:1px solid #27272a; border-radius:8px;
-               padding:10px 14px; }
-  .kpi-label { font-size:10px; color:#52525b; text-transform:uppercase;
-               letter-spacing:.08em; font-family:monospace; }
-  .kpi-value { font-size:18px; font-weight:700; font-family:monospace; margin-top:3px; }
+[data-testid="stSidebar"]{background:#0d0f13}
+.block-container{padding-top:1rem}
+.decision-card{border-radius:12px;padding:20px 24px;margin-bottom:12px;border:1px solid}
+.dc-long {background:rgba(34,197,94,.10);border-color:rgba(34,197,94,.35)}
+.dc-short{background:rgba(239,68,68,.10);border-color:rgba(239,68,68,.35)}
+.dc-wait {background:rgba(39,39,42,.5); border-color:#3f3f46}
+.dc-warn {background:rgba(245,158,11,.08);border-color:rgba(245,158,11,.3)}
+.big-sig {font-size:28px;font-weight:800;margin-bottom:6px}
+.reason  {font-size:13px;color:#a1a1aa;line-height:1.55;font-family:monospace}
+.note    {font-size:12px;color:#71717a;margin-top:8px;font-style:italic}
+.warn-box{background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.25);border-radius:8px;
+          padding:8px 12px;font-size:12px;color:#fca5a5;margin-top:8px;font-family:monospace}
+.kpi-card{background:#18181c;border:1px solid #27272a;border-radius:8px;padding:10px 14px}
+.kpi-l   {font-size:10px;color:#52525b;text-transform:uppercase;letter-spacing:.08em;font-family:monospace}
+.kpi-v   {font-size:18px;font-weight:700;font-family:monospace;margin-top:3px}
+.chat-user{background:#1c1c1f;border-radius:8px;padding:10px 14px;margin:6px 0;
+           font-family:monospace;font-size:13px;color:#e4e4e7}
+.chat-agent{background:#18181b;border-left:3px solid #22c55e;border-radius:0 8px 8px 0;
+            padding:10px 14px;margin:6px 0;font-family:monospace;font-size:13px;color:#a1a1aa}
+.conf-bar{height:6px;border-radius:3px;margin-top:6px}
 </style>
 """, unsafe_allow_html=True)
 
+# ── Strategy engine import ────────────────────────────────────────────────────
+try:
+    from nq_es_strategy import run_strategy, build_signal_context, backtest, performance_summary, TF_DEFAULTS
+except ImportError:
+    st.error("nq_es_strategy.py not found. Place it in the same directory.")
+    st.stop()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STRATEGY ENGINE  (same logic as nq_es_strategy.py)
-# ══════════════════════════════════════════════════════════════════════════════
-TF_DEFAULTS = {
-    "1min":  dict(pullback_thresh=0.0005, hold_bars=10, sl_pct=0.002, tp_pct=0.004,
-                  corr_window=20, ema_fast=20, ema_slow=50, momentum_bars=3, corr_thresh=0.70),
-    "5min":  dict(pullback_thresh=0.001,  hold_bars=8,  sl_pct=0.003, tp_pct=0.006,
-                  corr_window=20, ema_fast=20, ema_slow=50, momentum_bars=3, corr_thresh=0.70),
-    "30min": dict(pullback_thresh=0.002,  hold_bars=5,  sl_pct=0.005, tp_pct=0.010,
-                  corr_window=20, ema_fast=20, ema_slow=50, momentum_bars=3, corr_thresh=0.70),
-    "1hour": dict(pullback_thresh=0.003,  hold_bars=4,  sl_pct=0.007, tp_pct=0.014,
-                  corr_window=20, ema_fast=20, ema_slow=50, momentum_bars=3, corr_thresh=0.70),
-}
-NQ_POINT_VALUE = 20  # $20 per NQ point (E-mini)
+# ── Agent import (graceful degradation if Anthropic not configured) ───────────
+AGENT_AVAILABLE = False
+try:
+    from agent.trader_agent import (
+        TraderAgent, TraderMemory, TraderProfile, SessionState,
+        SignalContext, MarketContext, TradeRecord, SCMDecisionModels
+    )
+    from agent.intelligence_layer import build_market_context
+    AGENT_AVAILABLE = True
+except ImportError:
+    pass
 
-
-def run_strategy(es_df: pd.DataFrame, nq_df: pd.DataFrame, params: dict) -> pd.DataFrame:
-    """Core strategy — accepts pre-loaded DataFrames."""
-    for df in [es_df, nq_df]:
-        df.columns = df.columns.str.lower()
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
-            df = df.set_index("timestamp")
-    
-    # Re-index after setting timestamp as index
-    es = es_df.copy()
-    nq = nq_df.copy()
-    if "timestamp" in es.columns:
-        es["timestamp"] = pd.to_datetime(es["timestamp"])
-        es = es.set_index("timestamp")
-    if "timestamp" in nq.columns:
-        nq["timestamp"] = pd.to_datetime(nq["timestamp"])
-        nq = nq.set_index("timestamp")
-    
-    es = es.sort_index()
-    nq = nq.sort_index()
-
-    df = pd.DataFrame(index=nq.index)
-    df["NQ_open"]  = nq["open"]
-    df["NQ_high"]  = nq["high"]
-    df["NQ_low"]   = nq["low"]
-    df["NQ_close"] = nq["close"]
-    df["NQ_vol"]   = nq["volume"]
-    df["ES_close"] = es["close"]
-    df = df.dropna()
-
-    cw = params["corr_window"]
-    df["ret_NQ"]  = df["NQ_close"].pct_change()
-    df["ret_ES"]  = df["ES_close"].pct_change()
-    df["corr_20"] = df["ret_NQ"].rolling(cw).corr(df["ret_ES"])
-    df["ratio"]   = df["NQ_close"] / df["ES_close"]
-    df["ratio_ma"]= df["ratio"].rolling(cw).mean()
-    df["nq_stronger"] = df["ratio"] > df["ratio_ma"]
-    df["ema_fast"]= df["NQ_close"].ewm(span=params["ema_fast"]).mean()
-    df["ema_slow"]= df["NQ_close"].ewm(span=params["ema_slow"]).mean()
-    df["trend_nq"]= np.where(df["ema_fast"] > df["ema_slow"], 1, -1)
-    df["pullback"]= (df["NQ_close"] - df["ema_fast"]) / df["ema_fast"]
-    df["momentum"]= df["NQ_close"] - df["NQ_close"].shift(params["momentum_bars"])
-
-    pt, ct = params["pullback_thresh"], params["corr_thresh"]
-    df["long_signal"]  = ((df["trend_nq"]==1) & (df["pullback"]<-pt) &
-                          (df["momentum"]>0)   & (df["nq_stronger"]) & (df["corr_20"]>ct))
-    df["short_signal"] = ((df["trend_nq"]==-1) & (df["pullback"]>pt) &
-                          (df["momentum"]<0)   & (~df["nq_stronger"]) & (df["corr_20"]>ct))
-    return df.dropna()
-
-
-def backtest(df: pd.DataFrame, params: dict) -> list:
-    trades, in_trade, trade = [], False, None
-    for ts, row in df.iterrows():
-        if in_trade:
-            ep = trade["entry_price"]; d = trade["direction"]
-            exited = False
-            if d == "LONG":
-                if row["NQ_low"]  <= trade["sl"]: trade.update(exit_price=trade["sl"],  exit_time=str(ts), exit_reason="SL");   exited=True
-                elif row["NQ_high"]>= trade["tp"]: trade.update(exit_price=trade["tp"],  exit_time=str(ts), exit_reason="TP");   exited=True
-                elif trade["bars_held"] >= params["hold_bars"]: trade.update(exit_price=row["NQ_close"], exit_time=str(ts), exit_reason="TIME"); exited=True
-            else:
-                if row["NQ_high"] >= trade["sl"]: trade.update(exit_price=trade["sl"],  exit_time=str(ts), exit_reason="SL");   exited=True
-                elif row["NQ_low"] <= trade["tp"]: trade.update(exit_price=trade["tp"],  exit_time=str(ts), exit_reason="TP");   exited=True
-                elif trade["bars_held"] >= params["hold_bars"]: trade.update(exit_price=row["NQ_close"], exit_time=str(ts), exit_reason="TIME"); exited=True
-            if exited:
-                pts = (trade["exit_price"]-ep) if d=="LONG" else (ep-trade["exit_price"])
-                trade["pnl_pts"] = round(pts, 2)
-                trade["pnl_usd"] = round(pts * NQ_POINT_VALUE, 2)
-                trades.append(trade); in_trade = False
-            else:
-                trade["bars_held"] += 1; continue
-        if not in_trade:
-            ep = float(row["NQ_close"])
-            if row["long_signal"]:
-                trade = {"direction":"LONG", "entry_price":ep, "entry_time":str(ts), "bars_held":1,
-                         "sl":round(ep*(1-params["sl_pct"]),2), "tp":round(ep*(1+params["tp_pct"]),2)}
-                in_trade = True
-            elif row["short_signal"]:
-                trade = {"direction":"SHORT", "entry_price":ep, "entry_time":str(ts), "bars_held":1,
-                         "sl":round(ep*(1+params["sl_pct"]),2), "tp":round(ep*(1-params["tp_pct"]),2)}
-                in_trade = True
-    return trades
-
-
-def signal_score(row, params) -> int:
-    return sum([
-        row["trend_nq"] == 1,
-        float(row["corr_20"]) > params["corr_thresh"],
-        bool(row["nq_stronger"]),
-        abs(float(row["pullback"])) > params["pullback_thresh"] * 0.5,
-        float(row["momentum"]) != 0,
-    ])
+NQ_POINT_VALUE = 20
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA LOADERS
+# SESSION STATE INIT
 # ══════════════════════════════════════════════════════════════════════════════
+def _init_state():
+    defaults = {
+        "agent":           None,
+        "memory":          None,
+        "chat_messages":   [],
+        "last_signal":     None,
+        "last_market_ctx": None,
+        "last_decision":   None,
+        "df":              None,
+        "trades":          [],
+        "perf":            {},
+        "tf":              "30min",
+        "data_loaded":     False,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-def load_from_uploaded(nq_file, es_file) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load NQ + ES from Streamlit uploaded file objects."""
-    nq_df = pd.read_csv(nq_file)
-    es_df = pd.read_csv(es_file)
-    return nq_df, es_df
+_init_state()
 
 
-def load_from_topstep(tf: str) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    """
-    ── LIVE DATA: Topstep / Tradovate ──────────────────────────────────────
-    Topstep uses the Tradovate API under the hood.
-    Steps to activate:
-      1. Install:  pip install tradovate-api  (or use requests)
-      2. Set TOPSTEP_USERNAME and TOPSTEP_PASSWORD in Streamlit secrets
-         (Settings → Secrets in share.streamlit.app)
-      3. Uncomment and complete the connector in api/topstep_connector.py
-      4. Return two DataFrames with columns: timestamp, open, high, low, close, volume
-
-    Tradovate API docs: https://api.tradovate.com
-    Topstep help:       https://help.topstep.com/en/articles/api
-    ────────────────────────────────────────────────────────────────────────
-    """
-    if not TOPSTEP_AVAILABLE:
+def _get_agent() -> "TraderAgent | None":
+    if not AGENT_AVAILABLE:
         return None
-    try:
-        connector = TopstepConnector(
-            username=st.secrets["TOPSTEP_USERNAME"],
-            password=st.secrets["TOPSTEP_PASSWORD"],
-        )
-        nq_df = connector.get_bars("NQU4", tf)
-        es_df = connector.get_bars("ESU4", tf)
-        return nq_df, es_df
-    except Exception as e:
-        st.sidebar.warning(f"Topstep connection failed: {e}")
-        return None
-
-
-def load_from_tradingview(tf: str) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    """
-    ── LIVE DATA: TradingView Webhook ──────────────────────────────────────
-    TradingView Pine Script sends bar data to your webhook URL via alerts.
-    Steps to activate:
-      1. Deploy this app publicly (Streamlit Cloud or Railway)
-      2. Add the webhook URL to your TradingView alert:
-           https://YOUR_APP.streamlit.app/webhook
-      3. The Pine Script template is in api/tradingview_connector.py
-      4. Bars accumulate in st.session_state["tv_bars"][symbol][tf]
-
-    TradingView webhook docs: https://www.tradingview.com/support/solutions/43000529348
-    ────────────────────────────────────────────────────────────────────────
-    """
-    if not TRADINGVIEW_AVAILABLE:
-        return None
-    try:
-        nq_bars = get_latest_tv_bars("NQ1!", tf)
-        es_bars = get_latest_tv_bars("ES1!", tf)
-        if nq_bars is None or es_bars is None:
-            return None
-        return pd.DataFrame(nq_bars), pd.DataFrame(es_bars)
-    except Exception as e:
-        st.sidebar.warning(f"TradingView data unavailable: {e}")
-        return None
+    if st.session_state.agent is None:
+        # Load whichever key is available into env so llm_client.py can find it
+        for key_name in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY"):
+            if not os.environ.get(key_name):
+                try:
+                    val = st.secrets.get(key_name, "")
+                    if val:
+                        os.environ[key_name] = val
+                except Exception:
+                    pass
+        mem = TraderMemory(Path("trader_memory.json"))
+        st.session_state.agent  = TraderAgent(mem)
+        st.session_state.memory = mem
+    return st.session_state.agent
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RENDER HELPERS
+# SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
+def render_sidebar():
+    st.sidebar.markdown("## ⚙️ Settings")
 
-def render_decision(latest, params: dict):
-    is_long  = bool(latest["long_signal"])
-    is_short = bool(latest["short_signal"])
-    score    = signal_score(latest, params)
-    approaching = not is_long and not is_short and score >= 4
+    # ── Data source ──
+    st.sidebar.markdown("### Data source")
+    source = st.sidebar.radio(
+        "Source", ["📁 Upload CSV", "🔴 Topstep live", "📺 TradingView webhook"],
+        index=0, label_visibility="collapsed"
+    )
 
-    if is_long:
-        css = "signal-long"
-        label = "▲ ENTER LONG NOW"
-        color = "#22c55e"
-        reason = (f"NQ uptrend — pulled back {abs(latest['pullback'])*100:.2f}% below EMA{params['ema_fast']}, "
-                  f"momentum up, ES correlation {latest['corr_20']:.2f}.")
-    elif is_short:
-        css = "signal-short"
-        label = "▼ ENTER SHORT NOW"
-        color = "#ef4444"
-        reason = (f"NQ downtrend — extended {abs(latest['pullback'])*100:.2f}% above EMA{params['ema_fast']}, "
-                  f"momentum down, ES correlation {latest['corr_20']:.2f}.")
-    elif approaching:
-        css = "signal-warn"
-        label = "⚡ SIGNAL APPROACHING — WATCH NEXT BAR"
-        color = "#f59e0b"
-        reason = (f"{score}/5 conditions met. Pullback at {abs(latest['pullback'])*100:.3f}% "
-                  f"(threshold {params['pullback_thresh']*100:.2f}%).")
+    # ── Timeframe ──
+    st.sidebar.markdown("### Timeframe")
+    tf = st.sidebar.selectbox("Timeframe", list(TF_DEFAULTS.keys()), index=3,
+                               label_visibility="collapsed")
+
+    # ── Auto-refresh ──
+    auto_refresh = False; refresh_sec = 30
+    if source != "📁 Upload CSV":
+        st.sidebar.markdown("### Auto-refresh")
+        auto_refresh = st.sidebar.toggle("Enable", value=True)
+        refresh_sec  = st.sidebar.slider("Seconds", 10, 300, 30)
+
+    # ── Strategy params ──
+    st.sidebar.markdown("### Strategy parameters")
+    params = TF_DEFAULTS[tf].copy()
+    with st.sidebar.expander("Override defaults"):
+        params["pullback_thresh"] = st.slider("Pullback threshold",   0.0001, 0.010, params["pullback_thresh"], 0.0001, format="%.4f")
+        params["sl_pct"]          = st.slider("Stop-Loss %",          0.001,  0.020, params["sl_pct"],          0.001,  format="%.3f")
+        params["tp_pct"]          = st.slider("Take-Profit %",        0.001,  0.040, params["tp_pct"],          0.001,  format="%.3f")
+        params["hold_bars"]       = st.slider("Max hold (bars)",      1,      20,    params["hold_bars"])
+        params["corr_thresh"]     = st.slider("Correlation threshold",0.3,    0.99,  params["corr_thresh"],     0.01)
+
+    # ── Trader profile (for agent personalisation) ──
+    if AGENT_AVAILABLE:
+        st.sidebar.markdown("### Trader profile")
+        with st.sidebar.expander("Edit profile"):
+            agent = _get_agent()
+            if agent:
+                p = agent.memory.profile
+                new_name    = st.text_input("Name",            p.name)
+                new_account = st.number_input("Account ($)",   value=p.account_size_usd, step=5000.0)
+                new_risk    = st.slider("Risk per trade (%)",  0.1, 5.0, p.risk_per_trade_pct, 0.1)
+                new_style   = st.text_area("Trading style",   p.style_notes, height=60)
+                new_biases  = st.text_input("Known biases (comma-separated)", ", ".join(p.known_biases))
+                new_state   = st.selectbox("Emotional state today",
+                                           ["neutral","elevated","fatigued","overconfident"],
+                                           index=["neutral","elevated","fatigued","overconfident"].index(agent.memory.session.emotional_state))
+                if st.button("Save profile"):
+                    agent.update_profile(
+                        name=new_name, account_size_usd=new_account,
+                        risk_per_trade_pct=new_risk, style_notes=new_style,
+                        known_biases=[b.strip() for b in new_biases.split(",") if b.strip()],
+                    )
+                    agent.set_emotional_state(new_state)
+                    st.success("Profile saved.")
+
+    st.sidebar.markdown("---")
+
+    # ── AI provider status badge ──────────────────────────────────────────────
+    if AGENT_AVAILABLE:
+        try:
+            from agent.llm_client import provider_status
+            ps = provider_status()
+            badge_color = ps["color"]
+            badge_text  = ps["badge"]
+            model_text  = ps["model"]
+            badge_html  = (
+                "<div style='font-family:monospace;font-size:11px;padding:8px 10px;"
+                f"background:#18181c;border:1px solid #27272a;border-radius:6px;"
+                f"color:{badge_color}'>"
+                f"{badge_text}<br>"
+                f"<span style='color:#52525b'>Model: {model_text}</span>"
+                "</div>"
+            )
+            st.sidebar.markdown(badge_html, unsafe_allow_html=True)
+            if ps["status"] == "unconfigured":
+                st.sidebar.info(
+                    "**Set up AI agent (free):**\n\n"
+                    "1. Get free key → [aistudio.google.com](https://aistudio.google.com/app/apikey)\n"
+                    "2. Add to Streamlit secrets:\n"
+                    "   `GEMINI_API_KEY = \"AIza...\"`\n\n"
+                    "Upgrade later: add `ANTHROPIC_API_KEY`"
+                )
+        except Exception:
+            pass
+
+    st.sidebar.markdown("---")
+    st.sidebar.caption("⚠️ Not financial advice. Rules-based + AI decision support only.")
+
+    return source, tf, params, auto_refresh, refresh_sec
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA LOADING
+# ══════════════════════════════════════════════════════════════════════════════
+def load_data(source: str, tf: str, params: dict):
+    if source == "📁 Upload CSV":
+        col1, col2 = st.columns(2)
+        with col1:
+            nq_file = st.file_uploader("NQ CSV", type="csv", key="nq_upload",
+                                        help="Columns: timestamp, open, high, low, close, volume")
+        with col2:
+            es_file = st.file_uploader("ES CSV", type="csv", key="es_upload")
+        if not nq_file or not es_file:
+            st.info("Upload both NQ and ES CSV files to begin.")
+            _show_csv_format()
+            return None, None
+        return pd.read_csv(nq_file), pd.read_csv(es_file)
+
+    elif source == "🔴 Topstep live":
+        try:
+            from api.topstep_connector import TopstepConnector
+            conn  = TopstepConnector(st.secrets["TOPSTEP_USERNAME"], st.secrets["TOPSTEP_PASSWORD"])
+            nq_df = conn.get_bars("NQ", tf, n_bars=500)
+            es_df = conn.get_bars("ES", tf, n_bars=500)
+            st.success(f"🔴 Live Topstep — {tf} — {len(nq_df)} bars")
+            return nq_df, es_df
+        except Exception as e:
+            st.error(f"Topstep connection failed: {e}")
+            return None, None
+
+    elif source == "📺 TradingView webhook":
+        try:
+            from api.tradingview_connector import get_latest_tv_bars
+            nq_df = get_latest_tv_bars("NQ", tf)
+            es_df = get_latest_tv_bars("ES", tf)
+            if nq_df is None or es_df is None:
+                st.warning("No TradingView data yet. Check your Pine Script alerts and webhook URL.")
+                return None, None
+            return nq_df, es_df
+        except Exception as e:
+            st.error(f"TradingView data unavailable: {e}")
+            return None, None
+
+    return None, None
+
+
+def _show_csv_format():
+    st.markdown("**Expected CSV format (FRD / standard OHLCV):**")
+    st.code("timestamp,open,high,low,close,volume\n"
+            "2026-04-01 09:30,24100.25,24150.00,24080.50,24130.75,1250\n"
+            "2026-04-01 10:00,24130.75,24200.00,24120.00,24185.50,980", language="csv")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DECISION RENDERING
+# ══════════════════════════════════════════════════════════════════════════════
+def render_decision_card(decision: dict | None, signal_ctx: dict):
+    """Render the main decision card — agent output if available, else rule-based."""
+    if decision:
+        action     = decision.get("action", "WAIT")
+        headline   = decision.get("headline", "Stand by")
+        reason     = decision.get("reason", "")
+        note       = decision.get("agent_note", "")
+        confidence = decision.get("confidence_pct", 0)
+        warnings   = decision.get("warnings", [])
     else:
-        css = "signal-wait"
-        label = "— WAIT  ·  NO TRADE"
-        color = "#52525b"
-        reason = f"Only {score}/5 conditions aligned. No statistical edge. Stay flat."
+        # Fallback: pure rule-based
+        sig = signal_ctx.get("signal", "NONE")
+        action     = "ENTER_LONG" if sig == "LONG" else "ENTER_SHORT" if sig == "SHORT" else "WAIT"
+        score      = signal_ctx.get("score", 0)
+        approaching= signal_ctx.get("approaching", False)
+        if approaching: action = "APPROACHING"
+        headline   = {
+            "ENTER_LONG":  "▲ Enter long now",
+            "ENTER_SHORT": "▼ Enter short now",
+            "APPROACHING": "⚡ Signal approaching — watch next bar",
+            "WAIT":        "— Wait  ·  no trade",
+        }.get(action, "— Wait")
+        confidence = int(signal_ctx.get("confidence", 0) * 100)
+        reason     = f"{score}/5 conditions aligned." if action == "WAIT" else \
+                     f"All 5 conditions met on {signal_ctx.get('tf','?')} timeframe."
+        note       = ""; warnings = []
+
+    is_long   = "LONG"  in action
+    is_short  = "SHORT" in action
+    is_wait   = action == "WAIT"
+    is_near   = "APPROACH" in action
+
+    css   = "dc-long" if is_long else "dc-short" if is_short else "dc-warn" if is_near else "dc-wait"
+    color = "#22c55e" if is_long else "#ef4444" if is_short else "#f59e0b" if is_near else "#52525b"
 
     st.markdown(f"""
-    <div class="signal-box {css}">
-      <div class="big-label" style="color:{color}">{label}</div>
+    <div class="decision-card {css}">
+      <div class="big-sig" style="color:{color}">{headline}</div>
       <div class="reason">{reason}</div>
+      {"<div class='note'>" + note + "</div>" if note else ""}
+      {"".join(f"<div class='warn-box'>⚠ {w}</div>" for w in warnings)}
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Confidence bar
+    bar_color = "#22c55e" if confidence >= 70 else "#f59e0b" if confidence >= 40 else "#52525b"
+    st.markdown(f"""
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+      <div style="font-family:monospace;font-size:11px;color:#52525b;min-width:80px">Signal strength</div>
+      <div style="flex:1;background:#27272a;border-radius:3px;height:6px">
+        <div class="conf-bar" style="width:{confidence}%;background:{bar_color}"></div>
+      </div>
+      <div style="font-family:monospace;font-size:11px;color:{bar_color};min-width:32px;text-align:right">{confidence}%</div>
     </div>
     """, unsafe_allow_html=True)
 
     return is_long, is_short
 
 
-def render_trade_plan(latest, params: dict, is_long: bool, is_short: bool):
-    if not is_long and not is_short:
+def render_trade_plan(signal_ctx: dict, decision: dict | None, params: dict):
+    """Show the exact trade plan when a signal is active."""
+    sig = signal_ctx.get("signal", "NONE")
+    if sig == "NONE":
         return
-    ep = float(latest["NQ_close"])
-    sl = round(ep*(1-params["sl_pct"]),2) if is_long else round(ep*(1+params["sl_pct"]),2)
-    tp = round(ep*(1+params["tp_pct"]),2) if is_long else round(ep*(1-params["tp_pct"]),2)
-    risk_pts   = abs(ep-sl)
-    reward_pts = abs(ep-tp)
 
-    st.markdown("**Trade Plan**")
+    # Use SCM-sized plan from agent if available, else raw signal levels
+    if decision and decision.get("trade_plan"):
+        tp_data = decision["trade_plan"]
+        ep      = tp_data.get("entry",          signal_ctx["entry_price"])
+        sl      = tp_data.get("sl",             signal_ctx["sl"])
+        tp      = tp_data.get("tp",             signal_ctx["tp"])
+        contr   = tp_data.get("contracts",      1)
+        rr      = tp_data.get("rr_ratio",       signal_ctx["rr_ratio"])
+        hold    = tp_data.get("max_hold_bars",  params["hold_bars"])
+        nv_note = tp_data.get("newsvendor_note","")
+    else:
+        ep    = signal_ctx["entry_price"]; sl = signal_ctx["sl"]; tp = signal_ctx["tp"]
+        contr = 1; rr = signal_ctx["rr_ratio"]; hold = params["hold_bars"]; nv_note = ""
+
+    risk_pts   = abs(ep - sl);   reward_pts = abs(ep - tp)
+    risk_usd   = round(risk_pts  * NQ_POINT_VALUE * contr, 0)
+    reward_usd = round(reward_pts* NQ_POINT_VALUE * contr, 0)
+
+    st.markdown("**Trade plan**")
     rows = [
-        ("Entry price",   f"{ep:,.2f}",  "← enter at this bar's close"),
-        ("Stop-Loss",     f"{sl:,.2f}",  f"  {risk_pts:.1f} pts · ${risk_pts*NQ_POINT_VALUE:,.0f} risk"),
-        ("Take-Profit",   f"{tp:,.2f}",  f"  {reward_pts:.1f} pts · ${reward_pts*NQ_POINT_VALUE:,.0f} reward"),
-        ("Risk : Reward", f"1 : {params['tp_pct']/params['sl_pct']:.1f}", ""),
-        ("Max hold",      f"{params['hold_bars']} bars", "exit at market if TP/SL not hit"),
+        ("Entry",         f"{ep:,.2f}",          "← enter at this bar's close"),
+        ("Stop-Loss",     f"{sl:,.2f}",           f"{risk_pts:.1f} pts · ${risk_usd:,.0f} ({contr} contract{'s' if contr!=1 else ''})"),
+        ("Take-Profit",   f"{tp:,.2f}",           f"{reward_pts:.1f} pts · ${reward_usd:,.0f}"),
+        ("Risk : Reward", f"1 : {rr:.1f}",        ""),
+        ("Max hold",      f"{hold} bars",          "exit at market if not hit"),
+        ("Contracts",     str(contr),              "SCM EOQ-sized" if decision else "default"),
     ]
+    if nv_note:
+        rows.append(("Newsvendor",    nv_note[:60],      "SL/TP calibration"))
+
     for label, value, note in rows:
-        col_a, col_b, col_c = st.columns([2, 2, 3])
-        col_a.markdown(f"<span style='color:#52525b;font-size:12px;font-family:monospace'>{label}</span>", unsafe_allow_html=True)
-        color = "#3b82f6" if "Entry" in label else "#ef4444" if "Stop" in label else "#22c55e" if "Take" in label else "#f59e0b" if "Risk" in label else "#a1a1aa"
-        col_b.markdown(f"<span style='color:{color};font-size:16px;font-weight:700;font-family:monospace'>{value}</span>", unsafe_allow_html=True)
-        col_c.markdown(f"<span style='color:#52525b;font-size:11px;font-family:monospace'>{note}</span>", unsafe_allow_html=True)
+        vc = "#3b82f6" if "Entry" in label else "#ef4444" if "Stop" in label \
+             else "#22c55e" if "Take" in label else "#f59e0b" if "Risk" in label else "#a1a1aa"
+        c1, c2, c3 = st.columns([2,2,3])
+        c1.markdown(f"<span style='font-family:monospace;font-size:11px;color:#52525b'>{label}</span>", unsafe_allow_html=True)
+        c2.markdown(f"<span style='font-family:monospace;font-size:15px;font-weight:700;color:{vc}'>{value}</span>", unsafe_allow_html=True)
+        c3.markdown(f"<span style='font-family:monospace;font-size:10px;color:#52525b'>{note}</span>", unsafe_allow_html=True)
 
 
-def render_readiness(latest, params: dict):
-    score = signal_score(latest, params)
+def render_readiness(signal_ctx: dict, params: dict):
+    score = signal_ctx.get("score", 0)
     pct   = int(score / 5 * 100)
     color = "#22c55e" if pct >= 100 else "#f59e0b" if pct >= 60 else "#52525b"
-
-    st.markdown(f"**Signal Readiness — {pct}%**")
+    st.markdown(f"**Signal readiness — {pct}%**")
     st.progress(pct / 100)
-
-    checks = [
-        ("Trend aligned (EMA fast > slow)",      latest["trend_nq"] == 1),
-        ("High NQ/ES correlation",               float(latest["corr_20"]) > params["corr_thresh"]),
-        ("NQ outperforming ES",                  bool(latest["nq_stronger"])),
-        ("Pullback in range",                    abs(float(latest["pullback"])) > params["pullback_thresh"] * 0.5),
-        ("Momentum direction correct",           float(latest["momentum"]) != 0),
-    ]
-    for label, passed in checks:
-        icon = "✅" if passed else "⬜"
-        st.markdown(f"<span style='font-family:monospace;font-size:12px'>{icon}  {label}</span>",
+    for c in signal_ctx.get("conditions", []):
+        icon = "✅" if c["pass"] else "⬜"
+        st.markdown(f"<span style='font-family:monospace;font-size:11px'>{icon}  {c['label']}</span>",
                     unsafe_allow_html=True)
 
 
-def render_backtest_table(trades: list):
+def render_market_context(ctx: dict | None):
+    if not ctx:
+        st.caption("Market context: not available (configure live APIs)")
+        return
+    st.markdown("**External market intelligence**")
+    items = [
+        ("VIX",        f"{ctx.get('vix_level','—')} ({ctx.get('vix_regime','?')})"),
+        ("Put/Call",   str(ctx.get("put_call_ratio","—"))),
+        ("Session",    ctx.get("session_type","—")),
+        ("Macro",      ctx.get("macro_event_name","None") if ctx.get("macro_event_near") else "None nearby"),
+        ("News risk",  ctx.get("news_risk","—")),
+        ("Order flow", ctx.get("order_flow_note","—") or "—"),
+    ]
+    for label, val in items:
+        st.markdown(
+            f"<div style='display:flex;justify-content:space-between;font-family:monospace;font-size:11px;"
+            f"padding:3px 0;border-bottom:1px solid #1c1c1f'>"
+            f"<span style='color:#52525b'>{label}</span>"
+            f"<span style='color:#a1a1aa'>{val}</span></div>",
+            unsafe_allow_html=True
+        )
+    if ctx.get("news_summary"):
+        st.caption(f"News: {ctx['news_summary'][:120]}…")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKTEST TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+def render_backtest(trades: list, perf: dict):
     if not trades:
-        st.info("No signals fired on this timeframe in the loaded data. Try 5m or 1m.")
+        st.info("No signals fired on this timeframe/data. Try 5m or 1m.")
         return
 
-    wins     = [t for t in trades if t["pnl_usd"] > 0]
-    total_pnl = sum(t["pnl_usd"] for t in trades)
-    wr        = len(wins) / len(trades) * 100
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Trades",       perf.get("total_trades", 0))
+    c2.metric("Win rate",     f"{perf.get('win_rate',0)}%")
+    c3.metric("Net P&L",      f"${perf.get('total_pnl_usd',0):,.0f}")
+    c4.metric("Profit factor",str(perf.get("profit_factor","—")))
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Trades",      len(trades))
-    c2.metric("Win Rate",    f"{wr:.0f}%")
-    c3.metric("Net P&L",     f"${total_pnl:,.0f}", delta=f"${total_pnl:,.0f}")
-    g = sum(t["pnl_usd"] for t in wins)
-    l = abs(sum(t["pnl_usd"] for t in trades if t["pnl_usd"]<=0))
-    c4.metric("Profit Factor", f"{g/l:.2f}" if l > 0 else "∞")
-
-    df_trades = pd.DataFrame([{
-        "Dir":        t["direction"],
-        "Entry Time": t["entry_time"][:16],
-        "Entry ▶":   t["entry_price"],
-        "Stop-Loss":  t["sl"],
-        "Take-Profit":t["tp"],
-        "Exit Time":  (t.get("exit_time") or "")[:16],
-        "Exit ▶":    t.get("exit_price"),
-        "Reason":     t.get("exit_reason"),
-        "Pts":        t.get("pnl_pts"),
-        "P&L $":      t.get("pnl_usd"),
+    df_t = pd.DataFrame([{
+        "Dir":       t["direction"],
+        "Entry":     t["entry_time"][:16],
+        "Entry $":   t["entry_price"],
+        "SL":        t["sl"],
+        "TP":        t["tp"],
+        "Exit":      (t.get("exit_time") or "")[:16],
+        "Exit $":    t.get("exit_price"),
+        "Reason":    t.get("exit_reason"),
+        "Pts":       t.get("pnl_pts"),
+        "P&L $":     t.get("pnl_usd"),
+        "Conf %":    round(t.get("confidence",0)*100),
     } for t in trades])
 
     st.dataframe(
-        df_trades.style
-        .map(lambda v: "color: #22c55e" if v == "LONG" else "color: #ef4444" if v == "SHORT" else "",
-             subset=["Dir"])
-        .map(lambda v: "color: #22c55e; font-weight: bold" if isinstance(v, (int,float)) and v > 0
-             else "color: #ef4444; font-weight: bold" if isinstance(v, (int,float)) and v < 0 else "",
-             subset=["P&L $", "Pts"])
-        .format({"Entry ▶": "{:,.2f}", "Stop-Loss": "{:,.2f}",
-                 "Take-Profit": "{:,.2f}", "Exit ▶": "{:,.2f}",
-                 "Pts": "{:+.2f}", "P&L $": "${:+,.0f}"}),
-        use_container_width=True,
-        height=280,
+        df_t.style
+        .map(lambda v: "color:#22c55e" if v=="LONG" else "color:#ef4444" if v=="SHORT" else "", subset=["Dir"])
+        .map(lambda v: ("color:#22c55e;font-weight:bold" if isinstance(v,(int,float)) and v>0
+                        else "color:#ef4444;font-weight:bold" if isinstance(v,(int,float)) and v<0 else ""),
+             subset=["P&L $","Pts"])
+        .format({"Entry $":"{:,.2f}","SL":"{:,.2f}","TP":"{:,.2f}",
+                 "Exit $":"{:,.2f}","Pts":"{:+.2f}","P&L $":"${:+,.0f}","Conf %":"{}%"}),
+        use_container_width=True, height=260,
     )
 
     # Equity curve
-    cum = 0; equity = []
-    for t in trades:
-        cum += t["pnl_usd"]; equity.append(cum)
-
-    eq_df = pd.DataFrame({"Trade #": range(1, len(equity)+1), "Cumulative P&L": equity})
-    st.markdown("**Equity Curve**")
-    st.line_chart(eq_df.set_index("Trade #"), color="#22c55e" if equity[-1] >= 0 else "#ef4444")
+    cum=0; eq=[]; labels=[]
+    for i,t in enumerate(trades):
+        cum+=t["pnl_usd"]; eq.append(cum); labels.append(i+1)
+    st.markdown("**Equity curve**")
+    st.line_chart(pd.DataFrame({"Cumulative P&L ($)": eq}, index=labels))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
+# CHAT INTERFACE
 # ══════════════════════════════════════════════════════════════════════════════
+def render_chat(signal_ctx: dict, market_ctx: dict | None):
+    st.markdown("### 💬 Ask the agent")
+    st.caption("The agent knows your profile, today's session, and the current market context.")
 
-def sidebar() -> tuple:
-    st.sidebar.markdown("## ⚙️ Settings")
+    if not AGENT_AVAILABLE:
+        st.warning("Agent module not found. Ensure `agent/` folder is present.")
+        return
 
-    # Data source
-    st.sidebar.markdown("### Data Source")
-    data_source = st.sidebar.radio(
-        "Select source",
-        ["📁 Upload CSV files", "🔴 Topstep (live)", "📺 TradingView (webhook)"],
-        index=0,
-        help="Live sources require API setup. See README for instructions."
-    )
+    try:
+        from agent.llm_client import provider_status, active_provider
+        ps = provider_status()
+    except ImportError:
+        st.warning("llm_client.py not found in agent/ folder.")
+        return
 
-    # Timeframe
-    st.sidebar.markdown("### Timeframe")
-    tf = st.sidebar.selectbox("Timeframe", ["1min", "5min", "30min", "1hour"], index=2)
+    if ps["status"] == "unconfigured":
+        st.info(
+            "**Enable the AI agent in 2 minutes (free):**\n\n"
+            "1. Get a free Gemini API key at [aistudio.google.com](https://aistudio.google.com/app/apikey)\n"
+            "2. In Streamlit Cloud → your app → **Settings → Secrets**, add:\n"
+            "```toml\nGEMINI_API_KEY = \"AIza...\"\n```\n"
+            "3. Save and reboot the app.\n\n"
+            "To upgrade to Claude later, just add `ANTHROPIC_API_KEY = \"sk-ant-...\"` — "
+            "the system switches automatically."
+        )
+        return
 
-    # Auto-refresh (for live sources)
-    auto_refresh = False
-    refresh_interval = 30
-    if "live" in data_source.lower() or "tradingview" in data_source.lower():
-        st.sidebar.markdown("### Auto-refresh")
-        auto_refresh     = st.sidebar.checkbox("Enable auto-refresh", value=True)
-        refresh_interval = st.sidebar.slider("Interval (seconds)", 10, 300, 30)
+    st.caption(f"Using {ps['badge']} · {ps['model']}")
 
-    # Advanced params
-    st.sidebar.markdown("### Strategy Parameters")
-    with st.sidebar.expander("Override defaults"):
-        params = TF_DEFAULTS[tf].copy()
-        params["pullback_thresh"] = st.slider(
-            "Pullback threshold", 0.0001, 0.010, params["pullback_thresh"], 0.0001,
-            format="%.4f", help="How far price must pull back from EMA to qualify")
-        params["sl_pct"] = st.slider(
-            "Stop-Loss %", 0.001, 0.02, params["sl_pct"], 0.001, format="%.3f")
-        params["tp_pct"] = st.slider(
-            "Take-Profit %", 0.001, 0.04, params["tp_pct"], 0.001, format="%.3f")
-        params["hold_bars"] = st.slider(
-            "Max hold (bars)", 1, 20, params["hold_bars"])
-        params["corr_thresh"] = st.slider(
-            "Correlation threshold", 0.3, 0.99, params["corr_thresh"], 0.01)
-    
-    st.sidebar.markdown("---")
-    st.sidebar.markdown(
-        "[![GitHub](https://img.shields.io/badge/GitHub-View_Source-black?logo=github)]"
-        "(https://github.com/YOUR_USERNAME/nq-es-dashboard)",
-        unsafe_allow_html=True
-    )
-    st.sidebar.caption("⚠️ Not financial advice. Use at your own risk.")
+    agent = _get_agent()
+    if not agent:
+        return
 
-    return data_source, tf, params, auto_refresh, refresh_interval
+    for msg in st.session_state.chat_messages[-12:]:
+        css = "chat-user" if msg["role"]=="user" else "chat-agent"
+        st.markdown(f"<div class='{css}'>{msg['content']}</div>", unsafe_allow_html=True)
+
+    user_input = st.chat_input("Ask anything: 'Should I take this trade?', 'Why did the last signal fail?', 'Am I overtrading?'")
+    if user_input:
+        st.session_state.chat_messages.append({"role":"user","content":user_input})
+
+        sig_obj = None
+        if signal_ctx:
+            try:
+                from agent.trader_agent import SignalContext
+                sig_obj = SignalContext(**{k:v for k,v in signal_ctx.items()
+                                           if k in SignalContext.__dataclass_fields__})
+            except Exception:
+                pass
+
+        ctx_obj = None
+        if market_ctx:
+            try:
+                from agent.trader_agent import MarketContext
+                ctx_obj = MarketContext(**{k:v for k,v in market_ctx.items()
+                                           if k in MarketContext.__dataclass_fields__})
+            except Exception:
+                pass
+
+        with st.spinner("Agent thinking…"):
+            reply = agent.chat(user_input, sig_obj, ctx_obj)
+
+        st.session_state.chat_messages.append({"role":"assistant","content":reply})
+        st.rerun()
+
+    # Quick prompts
+    st.markdown("**Quick questions:**")
+    quick = [
+        "Should I take this trade given my recent losses?",
+        "What does my win rate tell me about my SL/TP settings?",
+        "Is this a bullwhip situation — should I wait?",
+        "How many contracts should I trade given my account size?",
+        "Explain why the signal has not fired yet on this timeframe.",
+    ]
+    cols = st.columns(2)
+    for i, q in enumerate(quick):
+        if cols[i%2].button(q, key=f"qp_{i}", use_container_width=True):
+            st.session_state.chat_messages.append({"role":"user","content":q})
+            agent_reply = agent.chat(q)
+            st.session_state.chat_messages.append({"role":"assistant","content":agent_reply})
+            st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN APP
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
-
 def main():
-    data_source, tf, params, auto_refresh, refresh_interval = sidebar()
+    source, tf, params, auto_refresh, refresh_sec = render_sidebar()
 
-    st.markdown("# NQ/ES Trade Decision")
+    st.markdown("# NQ/ES — AI Trade Decision System")
+    ts_str = datetime.now().strftime("%H:%M:%S")
     st.markdown(
-        f"<span style='font-family:monospace;font-size:12px;color:#52525b'>"
-        f"Timeframe: {tf} · Updated: {datetime.now().strftime('%H:%M:%S')}</span>",
+        f"<span style='font-family:monospace;font-size:11px;color:#52525b'>"
+        f"Timeframe: {tf}  ·  {source}  ·  {ts_str}</span>",
         unsafe_allow_html=True
     )
 
-    # ── Load data ─────────────────────────────────────────────────────────────
-    nq_df, es_df = None, None
+    # Load data
+    nq_df, es_df = load_data(source, tf, params)
+    if nq_df is None or es_df is None:
+        return
 
-    if "Upload" in data_source:
-        col1, col2 = st.columns(2)
-        with col1:
-            nq_file = st.file_uploader("NQ CSV", type="csv", key="nq_upload",
-                                        help="Must have: timestamp, open, high, low, close, volume")
-        with col2:
-            es_file = st.file_uploader("ES CSV", type="csv", key="es_upload")
-
-        if nq_file and es_file:
-            nq_df, es_df = load_from_uploaded(nq_file, es_file)
-            st.success(f"Loaded: NQ {len(nq_df)} rows · ES {len(es_df)} rows")
-        else:
-            st.info("👆 Upload both NQ and ES CSV files to begin. "
-                    "Use FRD-format files: timestamp, open, high, low, close, volume")
-            _show_sample_format()
-            return
-
-    elif "Topstep" in data_source:
-        if not TOPSTEP_AVAILABLE:
-            st.error("Topstep connector not installed. See `api/topstep_connector.py`.")
-            st.code("pip install tradovate-api\n# Then configure api/topstep_connector.py")
-            return
-        result = load_from_topstep(tf)
-        if result is None:
-            st.error("Could not connect to Topstep. Check your credentials in Streamlit secrets.")
-            return
-        nq_df, es_df = result
-        st.success(f"🔴 Live Topstep feed — {tf} — {len(nq_df)} bars loaded")
-
-    elif "TradingView" in data_source:
-        if not TRADINGVIEW_AVAILABLE:
-            st.error("TradingView connector not available. See `api/tradingview_connector.py`.")
-            return
-        result = load_from_tradingview(tf)
-        if result is None:
-            st.warning("No TradingView data received yet. "
-                       "Check your alert webhook URL and Pine Script setup.")
-            return
-        nq_df, es_df = result
-
-    # ── Run strategy ──────────────────────────────────────────────────────────
+    # Run strategy
     with st.spinner("Running strategy…"):
-        df      = run_strategy(es_df, nq_df, params)
-        trades  = backtest(df, params)
-        latest  = df.iloc[-1]
+        try:
+            df     = run_strategy(es_df, nq_df, params)
+            sig    = build_signal_context(df, params, tf)
+            trades = backtest(df, params)
+            perf   = performance_summary(trades)
+            st.session_state.df     = df
+            st.session_state.trades = trades
+            st.session_state.perf   = perf
+        except ValueError as e:
+            st.error(str(e)); return
 
-    # ── Layout: left (decision) / right (chart + trades) ─────────────────────
+    # Get market context
+    market_ctx = None
+    if AGENT_AVAILABLE:
+        try:
+            market_ctx = build_market_context()
+            st.session_state.last_market_ctx = market_ctx
+        except Exception:
+            pass
+
+    # Get agent decision
+    decision = None
+    agent    = _get_agent()
+    _llm_ready = False
+    if AGENT_AVAILABLE:
+        try:
+            from agent.llm_client import provider_status
+            _llm_ready = provider_status()["status"] == "active"
+        except Exception:
+            pass
+
+    if agent and _llm_ready:
+        with st.spinner("Agent analysing…"):
+            try:
+                from agent.trader_agent import SignalContext, MarketContext
+                sig_obj = SignalContext(**{k:v for k,v in sig.items()
+                                           if k in SignalContext.__dataclass_fields__})
+                ctx_obj = MarketContext(**(market_ctx or {})) if market_ctx else None
+                dec_obj = agent.decide(sig_obj, ctx_obj)
+                decision = {
+                    "action":         dec_obj.action,
+                    "confidence_pct": dec_obj.confidence_pct,
+                    "headline":       dec_obj.headline,
+                    "reason":         dec_obj.reason,
+                    "agent_note":     dec_obj.agent_note,
+                    "warnings":       dec_obj.warnings,
+                    "trade_plan":     dec_obj.trade_plan,
+                    "scm_sizing":     dec_obj.scm_sizing,
+                }
+                st.session_state.last_decision = decision
+            except Exception as e:
+                st.caption(f"Agent decision unavailable: {e}")
+
+    # ── Layout ────────────────────────────────────────────────────────────────
     left, right = st.columns([1, 2], gap="large")
 
     with left:
-        is_long, is_short = render_decision(latest, params)
+        is_long, is_short = render_decision_card(decision, sig)
         st.markdown("---")
-        render_trade_plan(latest, params, is_long, is_short)
+        render_trade_plan(sig, decision, params)
         st.markdown("---")
-        render_readiness(latest, params)
+        render_readiness(sig, params)
+        st.markdown("---")
+        render_market_context(market_ctx)
         st.markdown("---")
 
-        # Quick stats
-        wins = [t for t in trades if t["pnl_usd"] > 0]
-        wr   = len(wins)/len(trades)*100 if trades else 0
-        pnl  = sum(t["pnl_usd"] for t in trades)
-        st.markdown("**Historical Performance**")
-        st.markdown(f"""
-        <div class="kpi-grid">
-          <div class="kpi-card">
-            <div class="kpi-label">Win Rate</div>
-            <div class="kpi-value" style="color:{'#22c55e' if wr>=50 else '#ef4444'}">{wr:.0f}%</div>
-          </div>
-          <div class="kpi-card">
-            <div class="kpi-label">Net P&L</div>
-            <div class="kpi-value" style="color:{'#22c55e' if pnl>=0 else '#ef4444'}">${pnl:,.0f}</div>
-          </div>
-          <div class="kpi-card">
-            <div class="kpi-label">Total Trades</div>
-            <div class="kpi-value" style="color:#a1a1aa">{len(trades)}</div>
-          </div>
-          <div class="kpi-card">
-            <div class="kpi-label">Last bar</div>
-            <div class="kpi-value" style="color:#a1a1aa;font-size:12px">{str(df.index[-1])[:16]}</div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+        # Session summary
+        if agent:
+            mem = agent.memory
+            st.markdown("**Today's session**")
+            session_pnl = mem.session.session_pnl
+            pnl_color = "#22c55e" if session_pnl >= 0 else "#ef4444"
+            st.markdown(f"""
+            <div class="kpi-card" style="margin-bottom:8px">
+              <div class="kpi-l">Session P&L</div>
+              <div class="kpi-v" style="color:{pnl_color}">${session_pnl:+,.0f}</div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+              <div class="kpi-card"><div class="kpi-l">Trades today</div>
+                <div class="kpi-v" style="color:#a1a1aa">{mem.session.trades_taken}</div></div>
+              <div class="kpi-card"><div class="kpi-l">Emotional state</div>
+                <div class="kpi-v" style="color:#a1a1aa;font-size:13px">{mem.session.emotional_state}</div></div>
+            </div>
+            """, unsafe_allow_html=True)
 
     with right:
-        # Price chart
-        st.markdown("**NQ Price  ·  EMA20 / EMA50  ·  ▲▼ Signal markers**")
+        tab1, tab2, tab3 = st.tabs(["📈 Chart", "📋 Backtest", "💬 Agent chat"])
 
-        chart_data = df[["NQ_close", "ema_fast", "ema_slow"]].tail(200).copy()
-        chart_data.columns = ["NQ Close", "EMA 20", "EMA 50"]
-        st.line_chart(chart_data, color=["#a1a1aa", "#f59e0b", "#ef4444"])
+        with tab1:
+            st.markdown("**NQ price · EMA20 / EMA50 · ▲▼ Signal markers**")
+            chart = df[["NQ_close","ema_fast","ema_slow"]].tail(200).copy()
+            chart.columns = ["NQ Close","EMA 20","EMA 50"]
+            st.line_chart(chart, color=["#a1a1aa","#f59e0b","#ef4444"])
 
-        # Signal markers
-        long_bars  = df[df["long_signal"]].tail(50)
-        short_bars = df[df["short_signal"]].tail(50)
-        if len(long_bars):
-            st.success(f"▲ Last LONG signal: {str(long_bars.index[-1])[:16]}  "
-                       f"@ {long_bars['NQ_close'].iloc[-1]:,.2f}")
-        if len(short_bars):
-            st.error(f"▼ Last SHORT signal: {str(short_bars.index[-1])[:16]}  "
-                     f"@ {short_bars['NQ_close'].iloc[-1]:,.2f}")
+            longs  = df[df["long_signal"]].tail(20)
+            shorts = df[df["short_signal"]].tail(20)
+            if len(longs):
+                st.success(f"▲ Last LONG signal: {str(longs.index[-1])[:16]}  @ {longs['NQ_close'].iloc[-1]:,.2f}")
+            if len(shorts):
+                st.error  (f"▼ Last SHORT signal: {str(shorts.index[-1])[:16]}  @ {shorts['NQ_close'].iloc[-1]:,.2f}")
 
-        st.markdown("---")
-        st.markdown("**Backtest — All Signals in Loaded Data**")
-        render_backtest_table(trades)
+            # Correlation subplot
+            with st.expander("Rolling NQ/ES correlation"):
+                corr_data = df[["corr_20"]].tail(200).copy()
+                corr_data.columns = ["Correlation (20-bar)"]
+                st.line_chart(corr_data, color=["#a78bfa"])
+                st.caption(f"Threshold: {params['corr_thresh']}  ·  Current: {sig['corr_20']:.4f}")
 
-    # ── Auto-refresh ──────────────────────────────────────────────────────────
-    if auto_refresh and ("live" in data_source.lower() or "tradingview" in data_source.lower()):
-        st.markdown(f"<span style='color:#52525b;font-size:11px;font-family:monospace'>"
-                    f"Auto-refreshing every {refresh_interval}s…</span>", unsafe_allow_html=True)
-        time.sleep(refresh_interval)
+        with tab2:
+            render_backtest(trades, perf)
+
+        with tab3:
+            render_chat(sig, market_ctx)
+
+    # Auto-refresh
+    if auto_refresh and source != "📁 Upload CSV":
+        st.markdown(f"<span style='color:#52525b;font-size:10px;font-family:monospace'>↻ Refreshing in {refresh_sec}s…</span>",
+                    unsafe_allow_html=True)
+        time.sleep(refresh_sec)
         st.rerun()
-
-
-def _show_sample_format():
-    st.markdown("**Expected CSV format:**")
-    st.code(
-        "timestamp,open,high,low,close,volume\n"
-        "2026-04-01 09:30,24100.25,24150.00,24080.50,24130.75,1250\n"
-        "2026-04-01 10:00,24130.75,24200.00,24120.00,24185.50,980",
-        language="csv"
-    )
 
 
 if __name__ == "__main__":

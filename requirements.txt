@@ -1,7 +1,6 @@
-# NQ/ES Trade Decision Dashboard
+# NQ/ES AI Trade Decision System
 # ================================
-# Install all dependencies:
-#   pip install -r requirements.txt
+# pip install -r requirements.txt
 
 # ── Core strategy engine ──────────────────────────────────────────────────────
 pandas>=2.0.0
@@ -10,13 +9,21 @@ numpy>=1.24.0
 # ── Streamlit web app ─────────────────────────────────────────────────────────
 streamlit>=1.35.0
 
-# ── Topstep / Tradovate API connector ─────────────────────────────────────────
+# ── AI agent — Gemini (free default) ─────────────────────────────────────────
+# Get a free key at: https://aistudio.google.com/app/apikey
+# Add to Streamlit secrets: GEMINI_API_KEY = "AIza..."
+google-genai>=1.0.0
+
+# ── AI agent — Anthropic Claude (optional upgrade) ───────────────────────────
+# Add to Streamlit secrets: ANTHROPIC_API_KEY = "sk-ant-..."
+# The system switches automatically when this key is present.
+anthropic>=0.30.0
+
+# ── Live data connectors ──────────────────────────────────────────────────────
 requests>=2.31.0
-# websocket-client>=1.7.0       # Uncomment when using live WebSocket feed
 
-# ── TradingView webhook receiver ──────────────────────────────────────────────
-# flask>=3.0.0                  # Uncomment when running the webhook server
-
-# ── Optional: data export & charting ─────────────────────────────────────────
-# openpyxl>=3.1.0               # Uncomment to export trades to Excel
-# plotly>=5.18.0                # Uncomment for interactive Plotly charts in Streamlit
+# ── Optional live data sources (uncomment as you connect them) ────────────────
+# yfinance>=0.2.40         # VIX real-time
+# websocket-client>=1.7.0  # Tradovate WebSocket
+# flask>=3.0.0             # TradingView webhook receiver
+# newsapi-python>=0.2.7    # NewsAPI
