@@ -1,7 +1,0 @@
-# requirements-webhook.txt
-# For the TradingView webhook receiver deployed to Railway.app
-# Deploy command: python api/tradingview_connector.py --serve
-
-flask>=3.0.0
-pandas>=2.0.0
-gunicorn>=21.0.0   # production WSGI server (Railway uses this automatically)
